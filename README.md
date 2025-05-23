@@ -80,8 +80,12 @@ python image-renamer.py --stage all
 
 1. **Download and Rename**: Images are downloaded and renamed based on variant options.
 2. **Upload to AWS S3**: Images are uploaded to AWS S3, and public URLs are retrieved.
-3. **Generate CSV**: A CSV file is created with the necessary fields for Matrixify import.
-4. **Matrixify Import**: Use the generated CSV to import images into Shopify, ensuring correct variant mapping and gallery order.
+3. **Generate CSV with Global Gallery Order**: The script generates a Matrixify CSV where all images are assigned a unique, sequential Image Position. For each variant, the mapped image is first (with Variant ID), and any additional images for that variant immediately follow as product-level images. Images not mapped to any variant are added at the end. This ensures Shopify/Matrixify treat these as a "variant gallery" in the correct order.
+4. **Matrixify Import**: Use the generated CSV to import images into Shopify. The first image uses the REPLACE command (removing all existing images), and all others use MERGE, ensuring a full image refresh and correct gallery order.
+
+### Shopify Gallery Order Note
+
+Shopify does not have a true "variant gallery". Instead, the first image for a variant is mapped to the variant, and any additional images for that variant must immediately follow in the product gallery order as product-level images. This script ensures that all images for a variant are grouped together in the correct order, so Shopify displays them as a logical gallery for each variant.
 
 ## Notes
 
