@@ -244,21 +244,48 @@ def generate_matrixify_csv(product, upload_manifest, option_names):
     product_id = product['id'].split('/')[-1] if '/' in product['id'] else product['id']
     handle = product['handle']
     title = clean(product['title'])
-    csv_rows = []
+    # Build a mapping from variant_id to its images (in order)
+    variant_to_images = {}
+    product_level_images = []
     for entry in upload_manifest:
+        if entry['variant_id']:
+            variant_to_images.setdefault(entry['variant_id'], []).append(entry)
+        else:
+            product_level_images.append(entry)
+    # Build the global gallery order
+    gallery_list = []
+    # Get all variant IDs in the order they appear in the product
+    variant_ids = [v['node']['id'] for v in product['variants']['edges']]
+    for variant_id in variant_ids:
+        images = variant_to_images.get(variant_id, [])
+        if images:
+            # First image is mapped to the variant, rest are product-level
+            for i, entry in enumerate(images):
+                gallery_list.append({
+                    **entry,
+                    'variant_id': variant_id if i == 0 else None  # Only first image mapped to variant
+                })
+    # Add any remaining product-level images (not already included)
+    used_image_ids = set(e['image_id'] for e in gallery_list)
+    for entry in product_level_images:
+        if entry['image_id'] not in used_image_ids:
+            gallery_list.append(entry)
+    # Assign global Image Position
+    csv_rows = []
+    for idx, entry in enumerate(gallery_list, 1):
         row = {
             'ID': product_id,
             'Handle': handle,
             'Image Type': 'IMAGE',
             'Image Src': entry['file_url'],
-            'Image Command': 'REPLACE' if entry['gallery_position'] == 1 else 'MERGE',
-            'Image Position': entry['gallery_position'],
-            'Variant ID': entry['variant_id'].split('/')[-1] if entry['variant_id'] else '',
+            'Image Command': 'REPLACE' if idx == 1 else 'MERGE',
+            'Image Position': idx,
+            'Variant ID': entry['variant_id'].split('/')[-1] if entry.get('variant_id') else '',
         }
         for i, name in enumerate(option_names):
             row[f'Option{i+1} Name'] = name
             row[f'Option{i+1} Value'] = entry['options'][i] if i < len(entry['options']) else ''
-        row['Variant Image'] = entry['file_url'] if entry['variant_id'] else ''
+        row['Variant Image'] = entry['file_url'] if entry.get('variant_id') else ''
         csv_rows.append(row)
     # Build fieldnames dynamically
     max_options = len(option_names)
@@ -334,34 +361,14 @@ def rename_images(product, download_manifest):
     renamed_manifest = []
     # Group images by variant_id to handle numbering per variant
     variant_image_counts = {}
+    # Track the last set of variants for gallery images
+    last_variants = []
+    last_variant_filenames = {}
     for entry in download_manifest:
         variants = entry['variants']
-        if not variants:
-            # If no variants, use a generic name
-            new_filename = f"{clean(product['title'])}-{entry['original_filename']}"
-            gallery_position = 1
-            variant_id = None
-            options = []
-            # Ensure unique filenames
-            base, ext = os.path.splitext(new_filename)
-            counter = 1
-            while os.path.exists(os.path.join("renamed_images", new_filename)):
-                new_filename = f"{base}-{counter}{ext}"
-                counter += 1
-            # Copy the file to the new location
-            os.makedirs("renamed_images", exist_ok=True)
-            new_path = os.path.join("renamed_images", new_filename)
-            with open(entry['filename'], 'rb') as src, open(new_path, 'wb') as dst:
-                dst.write(src.read())
-            renamed_manifest.append({
-                **entry,
-                'new_filename': new_filename,
-                'filename': new_path,
-                'gallery_position': gallery_position,
-                'variant_id': variant_id,
-                'options': options
-            })
-        else:
+        if variants:
+            last_variants = []
+            last_variant_filenames = {}
             # For each variant, duplicate the image and number sequentially
             for variant in variants:
                 variant_id = variant['variant_id']
@@ -378,6 +385,74 @@ def rename_images(product, download_manifest):
                 _, ext = os.path.splitext(entry['original_filename'])
                 new_filename = f"{clean(product['title'])}-{options_str}-{counter_str}{ext}"
                 # Ensure unique filenames
+                base, ext2 = os.path.splitext(new_filename)
+                counter = 1
+                while os.path.exists(os.path.join("renamed_images", new_filename)):
+                    new_filename = f"{base}-{counter}{ext2}"
+                    counter += 1
+                # Copy the file to the new location
+                os.makedirs("renamed_images", exist_ok=True)
+                new_path = os.path.join("renamed_images", new_filename)
+                with open(entry['filename'], 'rb') as src, open(new_path, 'wb') as dst:
+                    dst.write(src.read())
+                renamed_manifest.append({
+                    **entry,
+                    'new_filename': new_filename,
+                    'filename': new_path,
+                    'gallery_position': variant_image_counts[variant_id],
+                    'variant_id': variant_id,
+                    'options': options
+                })
+                # Track for gallery images
+                last_variants.append({
+                    'variant_id': variant_id,
+                    'options': options
+                })
+                last_variant_filenames[variant_id] = f"{clean(product['title'])}-{options_str}"
+        else:
+            # If no variants, treat as gallery image for last variants
+            if last_variants:
+                for variant in last_variants:
+                    variant_id = variant['variant_id']
+                    options = variant['options']
+                    options_str = "-".join(clean(opt) for opt in options)
+                    # Use the last variant's filename base
+                    filename_base = last_variant_filenames.get(variant_id, f"{clean(product['title'])}-{options_str}")
+                    # Increment gallery position for this variant
+                    if variant_id not in variant_image_counts:
+                        variant_image_counts[variant_id] = 1
+                    else:
+                        variant_image_counts[variant_id] += 1
+                    counter_str = f"{variant_image_counts[variant_id]:02d}"
+                    # Get the file extension from the original filename
+                    _, ext = os.path.splitext(entry['original_filename'])
+                    new_filename = f"{filename_base}-{counter_str}{ext}"
+                    # Ensure unique filenames
+                    base, ext2 = os.path.splitext(new_filename)
+                    counter = 1
+                    while os.path.exists(os.path.join("renamed_images", new_filename)):
+                        new_filename = f"{base}-{counter}{ext2}"
+                        counter += 1
+                    # Copy the file to the new location
+                    os.makedirs("renamed_images", exist_ok=True)
+                    new_path = os.path.join("renamed_images", new_filename)
+                    with open(entry['filename'], 'rb') as src, open(new_path, 'wb') as dst:
+                        dst.write(src.read())
+                    renamed_manifest.append({
+                        **entry,
+                        'new_filename': new_filename,
+                        'filename': new_path,
+                        'gallery_position': variant_image_counts[variant_id],
+                        'variant_id': variant_id,
+                        'options': options
+                    })
+            else:
+                # If no last variants, use a generic name
+                new_filename = f"{clean(product['title'])}-{entry['original_filename']}"
+                gallery_position = 1
+                variant_id = None
+                options = []
+                # Ensure unique filenames
                 base, ext = os.path.splitext(new_filename)
                 counter = 1
                 while os.path.exists(os.path.join("renamed_images", new_filename)):
@@ -392,7 +467,7 @@ def rename_images(product, download_manifest):
                     **entry,
                     'new_filename': new_filename,
                     'filename': new_path,
-                    'gallery_position': variant_image_counts[variant_id],
+                    'gallery_position': gallery_position,
                     'variant_id': variant_id,
                     'options': options
                 })
