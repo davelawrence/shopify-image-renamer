@@ -6,10 +6,17 @@ import json
 import argparse
 from dotenv import load_dotenv
 from functools import wraps
+from datetime import datetime, timezone, timedelta
+import boto3
+import mimetypes
 
 print("Starting script...")
 load_dotenv()
+from dotenv import load_dotenv
+import os
 
+dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+load_dotenv(dotenv_path=dotenv_path)
 SHOPIFY_STORE = os.getenv("SHOPIFY_STORE")
 API_TOKEN = os.getenv("SHOPIFY_ADMIN_API_TOKEN")
 PRODUCT_ID = os.getenv("PRODUCT_ID", "gid://shopify/Product/9678733148457")
@@ -102,6 +109,7 @@ def get_product_data():
     """
     variables = {"id": PRODUCT_ID}
     data = graphql(query, variables)
+    print("\nAPI Response:", json.dumps(data, indent=2))
     if 'data' not in data:
         print('API response:', data)
         raise Exception("Shopify API response does not contain 'data'. Check your credentials, permissions, and product ID.")
@@ -112,155 +120,116 @@ def download_image(url, filename):
     with open(filename, 'wb') as f:
         f.write(r.content)
 
-def upload_image_to_shopify_files(filename):
-    # Step 1: Get a staged upload URL
-    staged_upload_query = """
-    mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-      stagedUploadsCreate(input: $input) {
-        stagedTargets {
-          url
-          resourceUrl
-          parameters {
-            name
-            value
+def get_file_url_by_id(file_id, max_attempts=20, delay=2):
+    query = """
+    query getFile($id: ID!) {
+      file(id: $id) {
+        ... on MediaImage {
+          id
+          fileStatus
+          preview {
+            image {
+              url
+            }
           }
         }
       }
     }
     """
-    staged_upload_variables = {
-        "input": [
-            {
-                "resource": "FILE",
-                "filename": filename,
-                "mimeType": "image/jpeg",
-                "httpMethod": "POST"
-            }
-        ]
-    }
-    staged_upload_response = graphql(staged_upload_query, staged_upload_variables)
-    if 'data' not in staged_upload_response or 'stagedUploadsCreate' not in staged_upload_response['data']:
-        print("Full staged_upload_response:", staged_upload_response)
-        raise Exception("Failed to get staged upload URL")
-    staged_target = staged_upload_response['data']['stagedUploadsCreate']['stagedTargets'][0]
-    upload_url = staged_target['url']
-    parameters = {param['name']: param['value'] for param in staged_target['parameters']}
-    with open(filename, 'rb') as f:
-        files = {'file': f}
-        upload_response = requests.post(upload_url, data=parameters, files=files)
-        if upload_response.status_code not in (200, 201):
-            raise Exception(f"Failed to upload file: {upload_response.text}")
-    # Step 2: Register the file in Shopify Files
-    files_create_query = """
-    mutation filesCreate($files: [FileCreateInput!]!) {
-      filesCreate(files: $files) {
-        files {
-          url
-        }
-        userErrors {
-          field
-          message
-        }
-      }
-    }
-    """
-    files_create_variables = {
-        "files": [
-            {
-                "originalSource": staged_target['resourceUrl'],
-                "contentType": "IMAGE",
-                "alt": filename
-            }
-        ]
-    }
-    files_create_response = graphql(files_create_query, files_create_variables)
-    if 'data' not in files_create_response or 'filesCreate' not in files_create_response['data']:
-        print("Full files_create_response:", files_create_response)
-        raise Exception("Failed to create file in Shopify Files")
-    file_url = files_create_response['data']['filesCreate']['files'][0]['url']
-    return file_url
-
-# --- Pipeline Stages ---
-
-def download_images(product, output_dir="downloaded_images"):
-    os.makedirs(output_dir, exist_ok=True)
-    images = product['images']['edges'] if 'images' in product else []
-    manifest = []
-    for img in images:
-        node = img['node']
-        url = node['originalSrc']
-        image_id = node['id']
-        filename = os.path.join(output_dir, f"{image_id}.jpg")
-        download_image(url, filename)
-        manifest.append({'image_id': image_id, 'original_url': url, 'filename': filename})
-    with open('download_manifest.json', 'w') as f:
-        json.dump(manifest, f, indent=2)
-    print(f"Downloaded {len(manifest)} images. Manifest saved to download_manifest.json.")
-    return manifest
-
-def rename_images(product, manifest, output_dir="renamed_images"):
-    os.makedirs(output_dir, exist_ok=True)
-    # Dynamically get all option names from all variants
-    all_option_names = set()
-    for variant in product['variants']['edges']:
-        for opt in variant['node']['selectedOptions']:
-            all_option_names.add(opt['name'])
-    option_names = list(all_option_names)
-    option_names.sort()
-    # Build mapping: image_id -> list of (variant_id, options)
-    image_to_variants = {}
-    for variant in product['variants']['edges']:
-        variant_node = variant['node']
-        variant_id = variant_node['id'].split('/')[-1] if '/' in variant_node['id'] else variant_node['id']
-        options = [opt['value'] for opt in variant_node['selectedOptions']]
-        while len(options) < len(option_names):
-            options.append('')
-        if variant_node['image']:
-            image_id = variant_node['image']['id']
-            if image_id not in image_to_variants:
-                image_to_variants[image_id] = []
-            image_to_variants[image_id].append((variant_id, options))
-    renamed_manifest = []
-    gallery_position = 1
-    for entry in manifest:
-        image_id = entry['image_id']
-        original_file = entry['filename']
-        if image_id in image_to_variants:
-            for idx, (variant_id, options) in enumerate(image_to_variants[image_id]):
-                variant_key = "-".join([clean(opt) for opt in options])
-                suffix = str(idx+1).zfill(2) if len(image_to_variants[image_id]) > 1 else "01"
-                new_filename = f"{clean(product['title'])}-{variant_key}-{suffix}.jpg"
-                new_path = os.path.join(output_dir, new_filename)
-                with open(original_file, 'rb') as src, open(new_path, 'wb') as dst:
-                    dst.write(src.read())
-                renamed_manifest.append({
-                    'variant_id': variant_id,
-                    'options': options,
-                    'filename': new_path,
-                    'gallery_position': gallery_position
-                })
-                gallery_position += 1
+    variables = {"id": file_id}
+    print("Waiting 10 seconds before polling for file status...")
+    time.sleep(10)
+    for attempt in range(max_attempts):
+        response = graphql(query, variables)
+        file_obj = response.get('data', {}).get('file')
+        if file_obj:
+            status = file_obj.get('fileStatus')
+            url = None
+            if file_obj.get('preview') and file_obj['preview'].get('image'):
+                url = file_obj['preview']['image'].get('url')
+            if status == 'READY' and url:
+                return url
+            print(f"Waiting for file to be READY (current status: {status}). Attempt {attempt+1}/{max_attempts}...")
         else:
-            new_filename = f"{clean(product['title'])}-gallery-{gallery_position:02d}.jpg"
-            new_path = os.path.join(output_dir, new_filename)
-            with open(original_file, 'rb') as src, open(new_path, 'wb') as dst:
-                dst.write(src.read())
-            renamed_manifest.append({
-                'variant_id': '',
-                'options': [],
-                'filename': new_path,
-                'gallery_position': gallery_position
-            })
-            gallery_position += 1
-    with open('renamed_manifest.json', 'w') as f:
-        json.dump(renamed_manifest, f, indent=2)
-    print(f"Renamed images. Manifest saved to renamed_manifest.json.")
-    return renamed_manifest, option_names
+            print(f"File with id {file_id} not found. Attempt {attempt+1}/{max_attempts}...")
+        time.sleep(delay)
+    raise Exception(f"File {file_id} did not become READY in time.")
+
+def fetch_recent_file_url_by_filename(filename, max_files=50, minutes_window=10):
+    # Query the most recent files from Shopify Files and try to match by filename and createdAt
+    query = f"""
+    query filesQuery {{
+      files(first: {max_files}, sortKey: CREATED_AT, reverse: true) {{
+        edges {{
+          node {{
+            ... on MediaImage {{
+              id
+              createdAt
+              originalFile {{
+                fileName
+              }}
+              preview {{
+                image {{
+                  url
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+    response = graphql(query)
+    files = response.get('data', {}).get('files', {}).get('edges', [])
+    base_filename = filename.rsplit('.', 1)[0]  # Remove extension for matching
+    now = datetime.now(timezone.utc)
+    for edge in files:
+        node = edge['node']
+        file_name = node.get('originalFile', {}).get('fileName', '')
+        created_at_str = node.get('createdAt')
+        created_at = None
+        if created_at_str:
+            try:
+                created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+            except Exception:
+                pass
+        # Fuzzy match: filename contains base_filename and created within the last X minutes
+        if base_filename in file_name and created_at and (now - created_at) <= timedelta(minutes=minutes_window):
+            url = node.get('preview', {}).get('image', {}).get('url')
+            if url:
+                print(f"Fallback: Found file by fuzzy match: {file_name} (created {created_at})")
+                return url
+    print(f"Fallback: No fuzzy match found for filename: {filename} in the last {minutes_window} minutes")
+    return None
+
+def upload_to_s3(file_path, s3_key):
+    load_dotenv()
+    aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
+    aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+    bucket = os.getenv('AWS_S3_BUCKET')
+    region = os.getenv('AWS_S3_REGION')
+    # Debug prints
+    print("DEBUG: AWS_S3_BUCKET =", bucket)
+    print("DEBUG: AWS_S3_REGION =", region)
+    print("DEBUG: All env vars:", dict(os.environ))
+    s3 = boto3.client(
+        's3',
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        region_name=region
+    )
+    content_type, _ = mimetypes.guess_type(file_path)
+    extra_args = {'ContentType': content_type} if content_type else {}
+    s3.upload_file(file_path, bucket, s3_key, ExtraArgs=extra_args)
+    url = f'https://{bucket}.s3.{region}.amazonaws.com/{s3_key}'
+    return url
 
 def upload_images(renamed_manifest):
     upload_manifest = []
     for entry in renamed_manifest:
-        file_url = upload_image_to_shopify_files(entry['filename'])
+        file_path = entry['filename']
+        s3_key = os.path.basename(file_path)
+        file_url = upload_to_s3(file_path, s3_key)
         upload_manifest.append({
             **entry,
             'file_url': file_url
@@ -268,12 +237,13 @@ def upload_images(renamed_manifest):
         time.sleep(1)
     with open('upload_manifest.json', 'w') as f:
         json.dump(upload_manifest, f, indent=2)
-    print(f"Uploaded images. Manifest saved to upload_manifest.json.")
+    print(f"Uploaded images to S3. Manifest saved to upload_manifest.json.")
     return upload_manifest
 
 def generate_matrixify_csv(product, upload_manifest, option_names):
     product_id = product['id'].split('/')[-1] if '/' in product['id'] else product['id']
     handle = product['handle']
+    title = clean(product['title'])
     csv_rows = []
     for entry in upload_manifest:
         row = {
@@ -283,7 +253,7 @@ def generate_matrixify_csv(product, upload_manifest, option_names):
             'Image Src': entry['file_url'],
             'Image Command': 'REPLACE' if entry['gallery_position'] == 1 else 'MERGE',
             'Image Position': entry['gallery_position'],
-            'Variant ID': entry['variant_id'],
+            'Variant ID': entry['variant_id'].split('/')[-1] if entry['variant_id'] else '',
         }
         for i, name in enumerate(option_names):
             row[f'Option{i+1} Name'] = name
@@ -297,13 +267,139 @@ def generate_matrixify_csv(product, upload_manifest, option_names):
         fieldnames.append(f'Option{i+1} Name')
         fieldnames.append(f'Option{i+1} Value')
     fieldnames.append('Variant Image')
-    csv_filename = 'matrixify-import.csv'
+    csv_filename = f'matrixify-import-{title}.csv'
     with open(csv_filename, 'w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         for row in csv_rows:
             writer.writerow(row)
     print(f"Wrote Matrixify CSV: {csv_filename}")
+
+def download_images(product, output_dir="downloaded_images"):
+    os.makedirs(output_dir, exist_ok=True)
+    images = product['images']['edges'] if 'images' in product else []
+    # Build variant mapping first
+    image_to_variants = {}
+    for variant in product['variants']['edges']:
+        variant_node = variant['node']
+        if variant_node['image']:
+            image_id = variant_node['image']['id']
+            if image_id not in image_to_variants:
+                image_to_variants[image_id] = []
+            variant_info = {
+                'variant_id': variant_node['id'],
+                'options': [opt for opt in variant_node['selectedOptions']]
+            }
+            image_to_variants[image_id].append(variant_info)
+    manifest = []
+    for img in images:
+        node = img['node']
+        url = node['originalSrc']
+        image_id = node['id']
+        # Extract original filename from URL
+        original_filename = url.split('/')[-1].split('?')[0]  # Remove query parameters
+        filename = os.path.join(output_dir, original_filename)
+        print(f"Downloading {original_filename}...")
+        download_image(url, filename)
+        # Include variant associations in manifest
+        manifest_entry = {
+            'image_id': image_id,
+            'original_url': url,
+            'original_filename': original_filename,
+            'filename': filename,
+            'variants': image_to_variants.get(image_id, [])  # List of variants this image is associated with
+        }
+        manifest.append(manifest_entry)
+        # Print variant associations for verification
+        if image_to_variants.get(image_id):
+            print("  Associated variants:")
+            for variant in image_to_variants[image_id]:
+                options_str = ", ".join(f"{opt['name']}: {opt['value']}" for opt in variant['options'])
+                print(f"    - {options_str}")
+        else:
+            print("  No variant associations")
+    with open('download_manifest.json', 'w') as f:
+        json.dump(manifest, f, indent=2)
+    print(f"\nDownloaded {len(manifest)} images. Manifest saved to download_manifest.json.")
+    return manifest
+
+def rename_images(product, download_manifest):
+    # Get all option names from variants
+    all_option_names = set()
+    for variant in product['variants']['edges']:
+        for opt in variant['node']['selectedOptions']:
+            all_option_names.add(opt['name'])
+    option_names = list(all_option_names)
+    option_names.sort()
+    renamed_manifest = []
+    # Group images by variant_id to handle numbering per variant
+    variant_image_counts = {}
+    for entry in download_manifest:
+        variants = entry['variants']
+        if not variants:
+            # If no variants, use a generic name
+            new_filename = f"{clean(product['title'])}-{entry['original_filename']}"
+            gallery_position = 1
+            variant_id = None
+            options = []
+            # Ensure unique filenames
+            base, ext = os.path.splitext(new_filename)
+            counter = 1
+            while os.path.exists(os.path.join("renamed_images", new_filename)):
+                new_filename = f"{base}-{counter}{ext}"
+                counter += 1
+            # Copy the file to the new location
+            os.makedirs("renamed_images", exist_ok=True)
+            new_path = os.path.join("renamed_images", new_filename)
+            with open(entry['filename'], 'rb') as src, open(new_path, 'wb') as dst:
+                dst.write(src.read())
+            renamed_manifest.append({
+                **entry,
+                'new_filename': new_filename,
+                'filename': new_path,
+                'gallery_position': gallery_position,
+                'variant_id': variant_id,
+                'options': options
+            })
+        else:
+            # For each variant, duplicate the image and number sequentially
+            for variant in variants:
+                variant_id = variant['variant_id']
+                options = [opt['value'] for opt in variant['options']]
+                options_str = "-".join(clean(opt) for opt in options)
+                # Initialize counter for this variant if not already done
+                if variant_id not in variant_image_counts:
+                    variant_image_counts[variant_id] = 1
+                else:
+                    variant_image_counts[variant_id] += 1
+                # Format the counter as a two-digit number (e.g., 01, 02, etc.)
+                counter_str = f"{variant_image_counts[variant_id]:02d}"
+                # Get the file extension from the original filename
+                _, ext = os.path.splitext(entry['original_filename'])
+                new_filename = f"{clean(product['title'])}-{options_str}-{counter_str}{ext}"
+                # Ensure unique filenames
+                base, ext = os.path.splitext(new_filename)
+                counter = 1
+                while os.path.exists(os.path.join("renamed_images", new_filename)):
+                    new_filename = f"{base}-{counter}{ext}"
+                    counter += 1
+                # Copy the file to the new location
+                os.makedirs("renamed_images", exist_ok=True)
+                new_path = os.path.join("renamed_images", new_filename)
+                with open(entry['filename'], 'rb') as src, open(new_path, 'wb') as dst:
+                    dst.write(src.read())
+                renamed_manifest.append({
+                    **entry,
+                    'new_filename': new_filename,
+                    'filename': new_path,
+                    'gallery_position': variant_image_counts[variant_id],
+                    'variant_id': variant_id,
+                    'options': options
+                })
+    with open('renamed_manifest.json', 'w') as f:
+        json.dump(renamed_manifest, f, indent=2)
+    print(f"Renamed {len(renamed_manifest)} images. Manifest saved to renamed_manifest.json.")
+    return renamed_manifest, option_names
 
 # --- CLI Controller ---
 def confirm_step(message):
