@@ -2,6 +2,8 @@ import os
 import requests
 import time
 import csv
+import json
+import argparse
 from dotenv import load_dotenv
 from functools import wraps
 
@@ -10,7 +12,7 @@ load_dotenv()
 
 SHOPIFY_STORE = os.getenv("SHOPIFY_STORE")
 API_TOKEN = os.getenv("SHOPIFY_ADMIN_API_TOKEN")
-PRODUCT_ID = "gid://shopify/Product/9678733148457"
+PRODUCT_ID = os.getenv("PRODUCT_ID", "gid://shopify/Product/9678733148457")
 
 print(f"SHOPIFY_STORE: {SHOPIFY_STORE}")
 print(f"API_TOKEN exists: {bool(API_TOKEN)}")
@@ -178,90 +180,184 @@ def upload_image_to_shopify_files(filename):
     file_url = files_create_response['data']['filesCreate']['files'][0]['url']
     return file_url
 
-def main():
-    product = get_product_data()
-    title = clean(product['title'])
-    handle = product['handle']
-    product_id = product['id'].split('/')[-1] if '/' in product['id'] else product['id']
-    # Get actual option names from the product (preserve case and spaces)
-    option_names = [opt['name'] for opt in product.get('variants', {}).get('edges', [{}])[0].get('node', {}).get('selectedOptions', [])]
-    while len(option_names) < 3:
-        option_names.append(f'Option{len(option_names)+1}')
-    # Build variant mapping
-    image_to_variant = {}
-    variant_id_to_options = {}
+# --- Pipeline Stages ---
+
+def download_images(product, output_dir="downloaded_images"):
+    os.makedirs(output_dir, exist_ok=True)
+    images = product['images']['edges'] if 'images' in product else []
+    manifest = []
+    for img in images:
+        node = img['node']
+        url = node['originalSrc']
+        image_id = node['id']
+        filename = os.path.join(output_dir, f"{image_id}.jpg")
+        download_image(url, filename)
+        manifest.append({'image_id': image_id, 'original_url': url, 'filename': filename})
+    with open('download_manifest.json', 'w') as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Downloaded {len(manifest)} images. Manifest saved to download_manifest.json.")
+    return manifest
+
+def rename_images(product, manifest, output_dir="renamed_images"):
+    os.makedirs(output_dir, exist_ok=True)
+    # Dynamically get all option names from all variants
+    all_option_names = set()
+    for variant in product['variants']['edges']:
+        for opt in variant['node']['selectedOptions']:
+            all_option_names.add(opt['name'])
+    option_names = list(all_option_names)
+    option_names.sort()
+    # Build mapping: image_id -> list of (variant_id, options)
+    image_to_variants = {}
     for variant in product['variants']['edges']:
         variant_node = variant['node']
         variant_id = variant_node['id'].split('/')[-1] if '/' in variant_node['id'] else variant_node['id']
         options = [opt['value'] for opt in variant_node['selectedOptions']]
-        while len(options) < 3:
+        while len(options) < len(option_names):
             options.append('')
-        variant_id_to_options[variant_id] = options
         if variant_node['image']:
             image_id = variant_node['image']['id']
-            image_to_variant[image_id] = (variant_id, options)
-    current_variant_key = None
-    variant_image_counts = {}
-    variant_first_image_written = {}
-    original_images = product['images']['edges'] if 'images' in product else []
-    csv_rows = []
-    for idx, img in enumerate(original_images):
-        node = img['node']
-        original_url = node['originalSrc']
-        variant_options = ['', '', '']
-        variant_id = ''
-        if node['id'] in image_to_variant:
-            variant_id, variant_options = image_to_variant[node['id']]
-            current_variant_key = "-".join(variant_options)
-        if node['id'] not in image_to_variant and current_variant_key:
-            variant_options = current_variant_key.split("-")
-        variant_key = "-".join([clean(opt) for opt in variant_options])
-        if variant_key not in variant_image_counts:
-            variant_image_counts[variant_key] = 1
+            if image_id not in image_to_variants:
+                image_to_variants[image_id] = []
+            image_to_variants[image_id].append((variant_id, options))
+    renamed_manifest = []
+    gallery_position = 1
+    for entry in manifest:
+        image_id = entry['image_id']
+        original_file = entry['filename']
+        if image_id in image_to_variants:
+            for idx, (variant_id, options) in enumerate(image_to_variants[image_id]):
+                variant_key = "-".join([clean(opt) for opt in options])
+                suffix = str(idx+1).zfill(2) if len(image_to_variants[image_id]) > 1 else "01"
+                new_filename = f"{clean(product['title'])}-{variant_key}-{suffix}.jpg"
+                new_path = os.path.join(output_dir, new_filename)
+                with open(original_file, 'rb') as src, open(new_path, 'wb') as dst:
+                    dst.write(src.read())
+                renamed_manifest.append({
+                    'variant_id': variant_id,
+                    'options': options,
+                    'filename': new_path,
+                    'gallery_position': gallery_position
+                })
+                gallery_position += 1
         else:
-            variant_image_counts[variant_key] += 1
-        suffix = str(variant_image_counts[variant_key]).zfill(2)
-        new_filename = f"{title}-{variant_key}-{suffix}.jpg"
-        print(f"Processing image: {new_filename}")
-        print(f"  Variant options: {variant_options}")
-        download_image(original_url, new_filename)
-        print(f"Downloaded and renamed: {new_filename}")
-        file_url = upload_image_to_shopify_files(new_filename)
-        print(f"Uploaded to Shopify Files: {file_url}")
-        image_command = 'REPLACE' if idx == 0 else 'MERGE'
-        # Only set Variant Image for the first image of each variant
-        variant_image_url = ''
-        if variant_id:
-            if variant_id not in variant_first_image_written:
-                variant_image_url = file_url
-                variant_first_image_written[variant_id] = True
+            new_filename = f"{clean(product['title'])}-gallery-{gallery_position:02d}.jpg"
+            new_path = os.path.join(output_dir, new_filename)
+            with open(original_file, 'rb') as src, open(new_path, 'wb') as dst:
+                dst.write(src.read())
+            renamed_manifest.append({
+                'variant_id': '',
+                'options': [],
+                'filename': new_path,
+                'gallery_position': gallery_position
+            })
+            gallery_position += 1
+    with open('renamed_manifest.json', 'w') as f:
+        json.dump(renamed_manifest, f, indent=2)
+    print(f"Renamed images. Manifest saved to renamed_manifest.json.")
+    return renamed_manifest, option_names
+
+def upload_images(renamed_manifest):
+    upload_manifest = []
+    for entry in renamed_manifest:
+        file_url = upload_image_to_shopify_files(entry['filename'])
+        upload_manifest.append({
+            **entry,
+            'file_url': file_url
+        })
+        time.sleep(1)
+    with open('upload_manifest.json', 'w') as f:
+        json.dump(upload_manifest, f, indent=2)
+    print(f"Uploaded images. Manifest saved to upload_manifest.json.")
+    return upload_manifest
+
+def generate_matrixify_csv(product, upload_manifest, option_names):
+    product_id = product['id'].split('/')[-1] if '/' in product['id'] else product['id']
+    handle = product['handle']
+    csv_rows = []
+    for entry in upload_manifest:
         row = {
             'ID': product_id,
             'Handle': handle,
             'Image Type': 'IMAGE',
-            'Image Src': file_url,
-            'Image Command': image_command,
-            'Image Position': idx + 1,
-            'Variant ID': variant_id,
-            'Option1 Name': option_names[0],
-            'Option1 Value': variant_options[0],
-            'Option2 Name': option_names[1],
-            'Option2 Value': variant_options[1],
-            'Option3 Name': option_names[2],
-            'Option3 Value': variant_options[2],
-            'Variant Image': variant_image_url
+            'Image Src': entry['file_url'],
+            'Image Command': 'REPLACE' if entry['gallery_position'] == 1 else 'MERGE',
+            'Image Position': entry['gallery_position'],
+            'Variant ID': entry['variant_id'],
         }
+        for i, name in enumerate(option_names):
+            row[f'Option{i+1} Name'] = name
+            row[f'Option{i+1} Value'] = entry['options'][i] if i < len(entry['options']) else ''
+        row['Variant Image'] = entry['file_url'] if entry['variant_id'] else ''
         csv_rows.append(row)
-        time.sleep(1)
-    # Write CSV
+    # Build fieldnames dynamically
+    max_options = len(option_names)
+    fieldnames = ['ID','Handle','Image Type','Image Src','Image Command','Image Position','Variant ID']
+    for i in range(max_options):
+        fieldnames.append(f'Option{i+1} Name')
+        fieldnames.append(f'Option{i+1} Value')
+    fieldnames.append('Variant Image')
     csv_filename = 'matrixify-import.csv'
-    fieldnames = ['ID','Handle','Image Type','Image Src','Image Command','Image Position','Variant ID','Option1 Name','Option1 Value','Option2 Name','Option2 Value','Option3 Name','Option3 Value','Variant Image']
     with open(csv_filename, 'w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         for row in csv_rows:
             writer.writerow(row)
     print(f"Wrote Matrixify CSV: {csv_filename}")
+
+# --- CLI Controller ---
+def confirm_step(message):
+    input(f"\n{message}\nPress Enter to continue...")
+
+def main():
+    parser = argparse.ArgumentParser(description="Shopify Image Renamer Pipeline")
+    parser.add_argument('--stage', choices=['download', 'rename', 'upload', 'generate-csv', 'all'], default='all', help='Pipeline stage to run')
+    parser.add_argument('--confirm', action='store_true', help='Pause for confirmation after each stage')
+    args = parser.parse_args()
+
+    product = get_product_data()
+    manifests = {}
+    option_names = []
+
+    if args.stage in ['download', 'all']:
+        manifests['download'] = download_images(product)
+        if args.confirm:
+            confirm_step("Download stage complete. Verify downloaded images and manifest.")
+    if args.stage in ['rename', 'all']:
+        if 'download' not in manifests:
+            with open('download_manifest.json') as f:
+                manifests['download'] = json.load(f)
+        manifests['rename'], option_names = rename_images(product, manifests['download'])
+        if args.confirm:
+            confirm_step("Rename stage complete. Verify renamed images and manifest.")
+    if args.stage in ['upload', 'all']:
+        if 'rename' not in manifests:
+            with open('renamed_manifest.json') as f:
+                manifests['rename'] = json.load(f)
+            # Option names are needed for CSV
+            all_option_names = set()
+            for variant in product['variants']['edges']:
+                for opt in variant['node']['selectedOptions']:
+                    all_option_names.add(opt['name'])
+            option_names = list(all_option_names)
+            option_names.sort()
+        manifests['upload'] = upload_images(manifests['rename'])
+        if args.confirm:
+            confirm_step("Upload stage complete. Verify uploaded image URLs and manifest.")
+    if args.stage in ['generate-csv', 'all']:
+        if 'upload' not in manifests:
+            with open('upload_manifest.json') as f:
+                manifests['upload'] = json.load(f)
+            if not option_names:
+                all_option_names = set()
+                for variant in product['variants']['edges']:
+                    for opt in variant['node']['selectedOptions']:
+                        all_option_names.add(opt['name'])
+                option_names = list(all_option_names)
+                option_names.sort()
+        generate_matrixify_csv(product, manifests['upload'], option_names)
+        if args.confirm:
+            confirm_step("CSV generation complete. Verify matrixify-import.csv.")
 
 if __name__ == "__main__":
     main()

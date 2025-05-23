@@ -5,9 +5,10 @@ This application automates the process of downloading, renaming, and re-uploadin
 ## Features
 
 - Downloads product images from Shopify.
-- Renames images according to a specific format.
+- Renames images according to a specific format, including all variant options.
 - Uploads images to Shopify Files and retrieves public URLs.
 - Generates a Matrixify-compatible CSV for bulk import.
+- Modular, CLI-driven workflow for robust testing and automation.
 
 ## Prerequisites
 
@@ -37,16 +38,38 @@ This application automates the process of downloading, renaming, and re-uploadin
 
 ## Usage
 
-Run the script to process images:
+### Modular Pipeline Stages
+
+You can run the workflow in modular stages for testing, or all at once for automation.
+
+#### Run a Single Stage (with optional confirmation):
 ```bash
-python image-renamer.py
+python image-renamer.py --stage download --confirm
+python image-renamer.py --stage rename --confirm
+python image-renamer.py --stage upload --confirm
+python image-renamer.py --stage generate-csv --confirm
 ```
 
-The script will:
-- Download images from the specified Shopify product.
-- Rename them according to the variant options.
-- Upload them to Shopify Files.
-- Generate a CSV file (`matrixify-import.csv`) for Matrixify import.
+#### Run All Stages in Sequence (for production):
+```bash
+python image-renamer.py --stage all
+```
+
+- The `--confirm` flag will pause after each stage so you can verify outputs before proceeding.
+- Intermediate artifacts (JSON manifests) are saved after each stage, so you can inspect or resume from any step.
+
+### Intermediate Artifacts
+- `download_manifest.json`: List of downloaded images and their original URLs.
+- `renamed_manifest.json`: List of renamed images and their variant associations.
+- `upload_manifest.json`: List of uploaded images and their Shopify CDN URLs.
+- `matrixify-import.csv`: The final CSV for Matrixify import.
+
+## Development & Testing Best Practices
+
+- The script is modular and each stage can be run independently for robust testing.
+- You can inspect intermediate files to verify correctness before moving to the next step.
+- For new product types or catalog changes, use the `--confirm` flag to layer in manual verification.
+- When satisfied, run the full pipeline automatically for efficiency.
 
 ## Workflow
 
@@ -59,6 +82,8 @@ The script will:
 
 - The script does not delete existing images; this is handled by Matrixify during the import process.
 - Only the first image for each variant is mapped to the variant; additional images appear in the gallery but are not variant-specific.
+- If a single image is mapped to multiple variants, the script duplicates and renames it for each variant association, ensuring unique filenames and URLs.
+- The script dynamically handles any number of variant options (future-proof for Shopify changes).
 
 ## License
 
