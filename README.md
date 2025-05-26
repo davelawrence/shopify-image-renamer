@@ -15,6 +15,7 @@ This application automates the process of downloading, renaming, and re-uploadin
 - Python 3.6 or higher.
 - Shopify Admin API access token.
 - Shopify store URL.
+- AWS S3 bucket for image hosting.
 
 ## Setup
 
@@ -40,6 +41,18 @@ This application automates the process of downloading, renaming, and re-uploadin
    AWS_S3_BUCKET=your-s3-bucket-name
    AWS_S3_REGION=your-s3-region
    ```
+
+## Version Control
+
+The repository is set up to ignore temporary and generated files:
+- `downloaded_images/`: Contains downloaded product images
+- `renamed_images/`: Contains renamed images ready for upload
+- `*.json`: Manifest files generated during the process
+- `*.csv`: Generated Matrixify import files
+- `*.jpg`: Image files
+- `.DS_Store`: macOS system files
+
+Only source code and documentation are tracked in version control.
 
 ## Usage
 

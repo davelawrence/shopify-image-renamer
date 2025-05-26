@@ -2,4 +2,8 @@
 *.pyc
 __pycache__/
 *.csv
-*.jpg 
+*.jpg
+.DS_Store
+downloaded_images/
+renamed_images/
+*.json 
