@@ -34,6 +34,7 @@ This application automates the process of downloading, renaming, and re-uploadin
    ```
    SHOPIFY_STORE=your-store.myshopify.com
    SHOPIFY_ADMIN_API_TOKEN=your-api-token
+   # Optional: Default PRODUCT_ID if not provided via command line
    PRODUCT_ID=gid://shopify/Product/your-product-id
    # AWS S3 credentials for image hosting
    AWS_ACCESS_KEY_ID=your-aws-access-key-id
@@ -56,21 +57,27 @@ Only source code and documentation are tracked in version control.
 
 ## Usage
 
+### Command Line Arguments
+
+- `--stage`: Required. Choose from: `download`, `rename`, `upload`, `generate-csv`, or `all`
+- `--confirm`: Optional. Pause for confirmation after each stage
+- `--product-id`: Optional. Shopify Product ID (e.g., 9660968927529). If not provided, uses PRODUCT_ID from .env
+
 ### Modular Pipeline Stages
 
 You can run the workflow in modular stages for testing, or all at once for automation.
 
 #### Run a Single Stage (with optional confirmation):
 ```bash
-python image-renamer.py --stage download --confirm
-python image-renamer.py --stage rename --confirm
-python image-renamer.py --stage upload --confirm
-python image-renamer.py --stage generate-csv --confirm
+python image-renamer.py --stage download --product-id 9660968927529 --confirm
+python image-renamer.py --stage rename --product-id 9660968927529 --confirm
+python image-renamer.py --stage upload --product-id 9660968927529 --confirm
+python image-renamer.py --stage generate-csv --product-id 9660968927529 --confirm
 ```
 
 #### Run All Stages in Sequence (for production):
 ```bash
-python image-renamer.py --stage all
+python image-renamer.py --stage all --product-id 9660968927529
 ```
 
 - The `--confirm` flag will pause after each stage so you can verify outputs before proceeding.

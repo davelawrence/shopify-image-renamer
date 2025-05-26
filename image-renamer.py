@@ -9,6 +9,7 @@ from functools import wraps
 from datetime import datetime, timezone, timedelta
 import boto3
 import mimetypes
+import sys
 
 print("Starting script...")
 load_dotenv()
@@ -480,12 +481,34 @@ def rename_images(product, download_manifest):
 def confirm_step(message):
     input(f"\n{message}\nPress Enter to continue...")
 
-def main():
-    parser = argparse.ArgumentParser(description="Shopify Image Renamer Pipeline")
-    parser.add_argument('--stage', choices=['download', 'rename', 'upload', 'generate-csv', 'all'], default='all', help='Pipeline stage to run')
-    parser.add_argument('--confirm', action='store_true', help='Pause for confirmation after each stage')
-    args = parser.parse_args()
+def parse_args():
+    parser = argparse.ArgumentParser(description='Shopify Image Renamer')
+    parser.add_argument('--stage', required=True, choices=['download', 'rename', 'upload', 'generate-csv', 'all'],
+                      help='Pipeline stage to run')
+    parser.add_argument('--confirm', action='store_true',
+                      help='Pause for confirmation after each stage')
+    parser.add_argument('--product-id', 
+                      help='Shopify Product ID (e.g., 9660968927529). If not provided, uses PRODUCT_ID from .env')
+    return parser.parse_args()
 
+def main():
+    args = parse_args()
+    
+    # Load environment variables
+    load_dotenv()
+    
+    # Get product ID from args or .env
+    product_id = args.product_id
+    if product_id:
+        # If product ID is provided without gid:// prefix, add it
+        if not product_id.startswith('gid://'):
+            product_id = f'gid://shopify/Product/{product_id}'
+    else:
+        product_id = os.getenv('PRODUCT_ID')
+        if not product_id:
+            print("Error: Product ID must be provided either via --product-id argument or PRODUCT_ID in .env file")
+            sys.exit(1)
+    
     product = get_product_data()
     manifests = {}
     option_names = []
