@@ -6,8 +6,10 @@ This application automates the process of downloading, renaming, and re-uploadin
 
 - Downloads product images from Shopify.
 - Renames images according to a specific format, including all variant options.
-- Uploads images to Shopify Files and retrieves public URLs.
+- Uploads images to AWS S3 and retrieves public URLs.
 - Generates a Matrixify-compatible CSV for bulk import.
+- Supports processing multiple products based on tags, vendor, and title keywords.
+- Includes S3 bucket cleanup functionality to manage storage.
 - Modular, CLI-driven workflow for robust testing and automation.
 
 ## Prerequisites
@@ -59,9 +61,62 @@ Only source code and documentation are tracked in version control.
 
 ### Command Line Arguments
 
-- `--stage`: Required. Choose from: `download`, `rename`, `upload`, `generate-csv`, or `all`
-- `--confirm`: Optional. Pause for confirmation after each stage
 - `--product-id`: Optional. Shopify Product ID (e.g., 9660968927529). If not provided, uses PRODUCT_ID from .env
+- `--product-ids`: Optional. Comma-separated list of Shopify Product IDs
+- `--tag`: Optional. Filter products by tag
+- `--vendor`: Optional. Filter products by vendor
+- `--title-keyword`: Optional. Filter products by title keyword
+- `--limit`: Optional. Maximum number of products to process (default: 50)
+- `--clean-s3`: Optional. Enable S3 bucket cleanup
+- `--s3-prefix`: Optional. Only delete S3 objects with this prefix
+- `--s3-days-old`: Optional. Only delete S3 objects older than this many days
+
+### Processing Multiple Products
+
+You can process multiple products at once using search criteria:
+
+```bash
+# Process all products with tag "VRF New" from vendor "Stressless" containing "recliner" in the title
+python image-renamer.py --tag "VRF New" --vendor "Stressless" --title-keyword "recliner"
+
+# Process up to 5 products with tag "VRF New"
+python image-renamer.py --tag "VRF New" --limit 5
+```
+
+When processing multiple products:
+- Images are organized in product-specific directories
+- A single combined Matrixify CSV is generated with a descriptive filename
+- The CSV includes all products with their respective variant images
+
+### S3 Bucket Cleanup
+
+Manage your S3 storage with flexible cleanup options:
+
+```bash
+# Clean all objects in the S3 bucket
+python image-renamer.py --clean-s3
+
+# Clean only objects with a specific prefix
+python image-renamer.py --clean-s3 --s3-prefix "sunrise-recliner"
+
+# Clean only objects older than 30 days
+python image-renamer.py --clean-s3 --s3-days-old 30
+
+# Combine with other operations
+python image-renamer.py --tag "VRF New" --clean-s3 --s3-days-old 7
+```
+
+### Single Product Processing
+
+For processing a single product:
+
+```bash
+# Process a single product by ID
+python image-renamer.py --product-id 9660968927529
+
+# Process multiple specific products
+python image-renamer.py --product-ids "9660968927529,9660968927530"
+```
 
 ### Modular Pipeline Stages
 
@@ -98,10 +153,11 @@ python image-renamer.py --stage all --product-id 9660968927529
 
 ## Workflow
 
-1. **Download and Rename**: Images are downloaded and renamed based on variant options.
-2. **Upload to AWS S3**: Images are uploaded to AWS S3, and public URLs are retrieved.
-3. **Generate CSV with Global Gallery Order**: The script generates a Matrixify CSV where all images are assigned a unique, sequential Image Position. For each variant, the mapped image is first (with Variant ID), and any additional images for that variant immediately follow as product-level images. Images not mapped to any variant are added at the end. This ensures Shopify/Matrixify treat these as a "variant gallery" in the correct order.
-4. **Matrixify Import**: Use the generated CSV to import images into Shopify. The first image uses the REPLACE command (removing all existing images), and all others use MERGE, ensuring a full image refresh and correct gallery order.
+1. **Cleanup**: The script automatically cleans up files from previous runs and optionally cleans the S3 bucket.
+2. **Download and Rename**: Images are downloaded and renamed based on variant options.
+3. **Upload to AWS S3**: Images are uploaded to AWS S3, and public URLs are retrieved.
+4. **Generate CSV with Global Gallery Order**: The script generates a Matrixify CSV where all images are assigned a unique, sequential Image Position. For each variant, the mapped image is first (with Variant ID), and any additional images for that variant immediately follow as product-level images. Images not mapped to any variant are added at the end. This ensures Shopify/Matrixify treat these as a "variant gallery" in the correct order.
+5. **Matrixify Import**: Use the generated CSV to import images into Shopify. The first image uses the REPLACE command (removing all existing images), and all others use MERGE, ensuring a full image refresh and correct gallery order.
 
 ### Shopify Gallery Order Note
 
@@ -109,6 +165,9 @@ Shopify does not have a true "variant gallery". Instead, the first image for a v
 
 ## Notes
 
+- The script automatically cleans up files from previous runs before starting.
+- You can use S3 cleanup to manage storage and stay within free tier limits.
+- When processing multiple products, a single combined CSV is generated with a descriptive filename based on the search criteria.
 - The script does not delete existing images; this is handled by Matrixify during the import process.
 - Only the first image for each variant is mapped to the variant; additional images appear in the gallery but are not variant-specific.
 - If a single image is mapped to multiple variants, the script duplicates and renames it for each variant association, ensuring unique filenames and URLs.
