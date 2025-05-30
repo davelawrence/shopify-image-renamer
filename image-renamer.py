@@ -11,20 +11,16 @@ import boto3
 import mimetypes
 import sys
 
-print("Starting script...")
-load_dotenv()
-from dotenv import load_dotenv
-import os
-
+# Load environment variables
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path=dotenv_path)
+
 SHOPIFY_STORE = os.getenv("SHOPIFY_STORE")
 API_TOKEN = os.getenv("SHOPIFY_ADMIN_API_TOKEN")
-PRODUCT_ID = os.getenv("PRODUCT_ID", "gid://shopify/Product/9678733148457")
 
-print(f"SHOPIFY_STORE: {SHOPIFY_STORE}")
-print(f"API_TOKEN exists: {bool(API_TOKEN)}")
-print(f"PRODUCT_ID: {PRODUCT_ID}")
+if not SHOPIFY_STORE or not API_TOKEN:
+    print("Error: Required environment variables SHOPIFY_STORE and SHOPIFY_ADMIN_API_TOKEN must be set")
+    sys.exit(1)
 
 HEADERS = {
     "Content-Type": "application/json",
@@ -67,14 +63,14 @@ def graphql(query, variables=None):
 
 def clean(text):
     # Remove pipes, extra dashes, and clean up the text
-    cleaned = text.lower().replace("|", " ").replace("/", "-").replace(",", "").replace("&", "and")
+    cleaned = text.lower().replace("|", " ").replace("/", "-").replace(",", "").replace("&", "and").replace("+", "-")
     cleaned = cleaned.replace(" ", "-")
     while "--" in cleaned:
         cleaned = cleaned.replace("--", "-")
     cleaned = cleaned.strip("-")
     return cleaned
 
-def get_product_data():
+def get_product_data(product_id):
     query = """
     query getProduct($id: ID!) {
       product(id: $id) {
@@ -108,7 +104,7 @@ def get_product_data():
       }
     }
     """
-    variables = {"id": PRODUCT_ID}
+    variables = {"id": product_id}
     data = graphql(query, variables)
     print("\nAPI Response:", json.dumps(data, indent=2))
     if 'data' not in data:
@@ -204,15 +200,14 @@ def fetch_recent_file_url_by_filename(filename, max_files=50, minutes_window=10)
     return None
 
 def upload_to_s3(file_path, s3_key):
-    load_dotenv()
     aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
     aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
     bucket = os.getenv('AWS_S3_BUCKET')
     region = os.getenv('AWS_S3_REGION')
-    # Debug prints
-    print("DEBUG: AWS_S3_BUCKET =", bucket)
-    print("DEBUG: AWS_S3_REGION =", region)
-    print("DEBUG: All env vars:", dict(os.environ))
+    
+    if not all([aws_access_key_id, aws_secret_access_key, bucket, region]):
+        raise ValueError("Missing required AWS environment variables")
+        
     s3 = boto3.client(
         's3',
         aws_access_key_id=aws_access_key_id,
@@ -227,7 +222,9 @@ def upload_to_s3(file_path, s3_key):
 
 def upload_images(renamed_manifest):
     upload_manifest = []
-    for entry in renamed_manifest:
+    # Handle both list and dict formats of renamed_manifest
+    manifest_entries = renamed_manifest[0] if isinstance(renamed_manifest, tuple) else renamed_manifest
+    for entry in manifest_entries:
         file_path = entry['filename']
         s3_key = os.path.basename(file_path)
         file_url = upload_to_s3(file_path, s3_key)
@@ -477,81 +474,116 @@ def rename_images(product, download_manifest):
     print(f"Renamed {len(renamed_manifest)} images. Manifest saved to renamed_manifest.json.")
     return renamed_manifest, option_names
 
-# --- CLI Controller ---
-def confirm_step(message):
-    input(f"\n{message}\nPress Enter to continue...")
+def search_products(tag=None, vendor=None, title_keyword=None, limit=50):
+    query = """
+    query searchProducts($query: String!, $first: Int!) {
+      products(first: $first, query: $query) {
+        edges {
+          node {
+            id
+            handle
+            title
+            vendor
+            tags
+          }
+        }
+      }
+    }
+    """
+    
+    # Build the search query
+    search_terms = []
+    if tag:
+        search_terms.append(f"tag:{tag}")
+    if vendor:
+        search_terms.append(f"vendor:{vendor}")
+    if title_keyword:
+        search_terms.append(f"title:*{title_keyword}*")
+    
+    search_query = " AND ".join(search_terms) if search_terms else ""
+    variables = {
+        "query": search_query,
+        "first": limit
+    }
+    
+    data = graphql(query, variables)
+    products = data.get('data', {}).get('products', {}).get('edges', [])
+    return [edge['node'] for edge in products]
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Shopify Image Renamer')
-    parser.add_argument('--stage', required=True, choices=['download', 'rename', 'upload', 'generate-csv', 'all'],
-                      help='Pipeline stage to run')
-    parser.add_argument('--confirm', action='store_true',
-                      help='Pause for confirmation after each stage')
-    parser.add_argument('--product-id', 
-                      help='Shopify Product ID (e.g., 9660968927529). If not provided, uses PRODUCT_ID from .env')
+    parser = argparse.ArgumentParser(description='Process product images for Shopify.')
+    parser.add_argument('--product-id', help='Shopify product ID (gid://shopify/Product/...)')
+    parser.add_argument('--product-ids', help='Comma-separated list of Shopify product IDs')
+    parser.add_argument('--tag', help='Filter products by tag')
+    parser.add_argument('--vendor', help='Filter products by vendor')
+    parser.add_argument('--title-keyword', help='Filter products by title keyword')
+    parser.add_argument('--limit', type=int, default=50, help='Maximum number of products to process')
     return parser.parse_args()
 
 def main():
     args = parse_args()
     
-    # Load environment variables
-    load_dotenv()
-    
-    # Get product ID from args or .env
-    product_id = args.product_id
-    if product_id:
-        # If product ID is provided without gid:// prefix, add it
+    if args.tag or args.vendor or args.title_keyword:
+        print("Searching for products with criteria...")
+        # Search for products based on criteria
+        products = search_products(
+            tag=args.tag,
+            vendor=args.vendor,
+            title_keyword=args.title_keyword,
+            limit=args.limit
+        )
+        
+        if not products:
+            print("No products found matching the search criteria.")
+            return
+            
+        print(f"Found {len(products)} products matching the criteria.")
+        for product in products:
+            print(f"\nProcessing product: {product['title']} (ID: {product['id']})")
+            
+            # Create product-specific directories
+            product_id = product['id'].split('/')[-1]
+            download_dir = f"downloaded_images/{product_id}"
+            renamed_dir = f"renamed_images/{product_id}"
+            os.makedirs(download_dir, exist_ok=True)
+            os.makedirs(renamed_dir, exist_ok=True)
+            
+            print("Getting full product data...")
+            # Get full product data
+            full_product = get_product_data(product['id'])
+            
+            print("Downloading images...")
+            # Download images
+            download_manifest = download_images(full_product, download_dir)
+            
+            print("Renaming images...")
+            # Rename images
+            renamed_manifest = rename_images(full_product, download_manifest)
+            
+            print("Uploading to S3...")
+            # Upload to S3
+            upload_manifest = upload_images(renamed_manifest)
+            
+            print("Generating Matrixify CSV...")
+            # Generate Matrixify CSV
+            option_names = [opt['name'] for opt in full_product['variants']['edges'][0]['node']['selectedOptions']]
+            generate_matrixify_csv(full_product, upload_manifest, option_names)
+            
+            print(f"Completed processing for product: {product['title']}")
+    elif args.product_id:
+        # Original single product flow
+        product_id = args.product_id
         if not product_id.startswith('gid://'):
             product_id = f'gid://shopify/Product/{product_id}'
+        product = get_product_data(product_id)
+        download_manifest = download_images(product)
+        renamed_manifest = rename_images(product, download_manifest)
+        upload_manifest = upload_images(renamed_manifest)
+        option_names = [opt['name'] for opt in product['variants']['edges'][0]['node']['selectedOptions']]
+        generate_matrixify_csv(product, upload_manifest, option_names)
     else:
-        product_id = os.getenv('PRODUCT_ID')
-        if not product_id:
-            print("Error: Product ID must be provided either via --product-id argument or PRODUCT_ID in .env file")
-            sys.exit(1)
-    
-    product = get_product_data()
-    manifests = {}
-    option_names = []
-
-    if args.stage in ['download', 'all']:
-        manifests['download'] = download_images(product)
-        if args.confirm:
-            confirm_step("Download stage complete. Verify downloaded images and manifest.")
-    if args.stage in ['rename', 'all']:
-        if 'download' not in manifests:
-            with open('download_manifest.json') as f:
-                manifests['download'] = json.load(f)
-        manifests['rename'], option_names = rename_images(product, manifests['download'])
-        if args.confirm:
-            confirm_step("Rename stage complete. Verify renamed images and manifest.")
-    if args.stage in ['upload', 'all']:
-        if 'rename' not in manifests:
-            with open('renamed_manifest.json') as f:
-                manifests['rename'] = json.load(f)
-            # Option names are needed for CSV
-            all_option_names = set()
-            for variant in product['variants']['edges']:
-                for opt in variant['node']['selectedOptions']:
-                    all_option_names.add(opt['name'])
-            option_names = list(all_option_names)
-            option_names.sort()
-        manifests['upload'] = upload_images(manifests['rename'])
-        if args.confirm:
-            confirm_step("Upload stage complete. Verify uploaded image URLs and manifest.")
-    if args.stage in ['generate-csv', 'all']:
-        if 'upload' not in manifests:
-            with open('upload_manifest.json') as f:
-                manifests['upload'] = json.load(f)
-            if not option_names:
-                all_option_names = set()
-                for variant in product['variants']['edges']:
-                    for opt in variant['node']['selectedOptions']:
-                        all_option_names.add(opt['name'])
-                option_names = list(all_option_names)
-                option_names.sort()
-        generate_matrixify_csv(product, manifests['upload'], option_names)
-        if args.confirm:
-            confirm_step("CSV generation complete. Verify matrixify-import.csv.")
+        print("Error: Please provide either --product-id, --product-ids, or search criteria (--tag, --vendor, --title-keyword)")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
