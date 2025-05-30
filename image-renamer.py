@@ -10,6 +10,95 @@ from datetime import datetime, timezone, timedelta
 import boto3
 import mimetypes
 import sys
+import shutil
+
+def cleanup_s3_bucket(prefix=None, days_old=None):
+    """Clean up objects in the S3 bucket.
+    
+    Args:
+        prefix (str, optional): Only delete objects with this prefix
+        days_old (int, optional): Only delete objects older than this many days
+    """
+    aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
+    aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+    bucket = os.getenv('AWS_S3_BUCKET')
+    region = os.getenv('AWS_S3_REGION')
+    
+    if not all([aws_access_key_id, aws_secret_access_key, bucket, region]):
+        raise ValueError("Missing required AWS environment variables")
+    
+    s3 = boto3.client(
+        's3',
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        region_name=region
+    )
+    
+    # List objects in bucket
+    list_kwargs = {'Bucket': bucket}
+    if prefix:
+        list_kwargs['Prefix'] = prefix
+    
+    deleted_count = 0
+    while True:
+        response = s3.list_objects_v2(**list_kwargs)
+        if 'Contents' not in response:
+            break
+            
+        for obj in response['Contents']:
+            # Check if object is old enough to delete
+            if days_old:
+                last_modified = obj['LastModified']
+                age = datetime.now(timezone.utc) - last_modified
+                if age.days < days_old:
+                    continue
+            
+            # Delete the object
+            s3.delete_object(Bucket=bucket, Key=obj['Key'])
+            deleted_count += 1
+            print(f"Deleted: {obj['Key']}")
+        
+        # Check if there are more objects to list
+        if not response.get('IsTruncated'):
+            break
+        list_kwargs['ContinuationToken'] = response['NextContinuationToken']
+    
+    print(f"Deleted {deleted_count} objects from S3 bucket")
+
+def cleanup_previous_run(clean_s3=False, s3_prefix=None, s3_days_old=None):
+    """Clean up files and directories from previous runs.
+    
+    Args:
+        clean_s3 (bool): Whether to clean up S3 bucket
+        s3_prefix (str, optional): Only delete S3 objects with this prefix
+        s3_days_old (int, optional): Only delete S3 objects older than this many days
+    """
+    print("Cleaning up files from previous run...")
+    
+    # Remove directories
+    for dir_name in ['downloaded_images', 'renamed_images']:
+        if os.path.exists(dir_name):
+            shutil.rmtree(dir_name)
+            print(f"Removed directory: {dir_name}")
+    
+    # Remove JSON files
+    for file_name in ['download_manifest.json', 'renamed_manifest.json', 'upload_manifest.json']:
+        if os.path.exists(file_name):
+            os.remove(file_name)
+            print(f"Removed file: {file_name}")
+    
+    # Remove Matrixify CSV files
+    for file_name in os.listdir('.'):
+        if file_name.startswith('matrixify-import-') and file_name.endswith('.csv'):
+            os.remove(file_name)
+            print(f"Removed file: {file_name}")
+    
+    # Clean up S3 if requested
+    if clean_s3:
+        try:
+            cleanup_s3_bucket(prefix=s3_prefix, days_old=s3_days_old)
+        except Exception as e:
+            print(f"Warning: Failed to clean S3 bucket: {e}")
 
 # Load environment variables
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -238,7 +327,7 @@ def upload_images(renamed_manifest):
     print(f"Uploaded images to S3. Manifest saved to upload_manifest.json.")
     return upload_manifest
 
-def generate_matrixify_csv(product, upload_manifest, option_names):
+def generate_matrixify_csv(product, upload_manifest, option_names, csv_filename=None):
     product_id = product['id'].split('/')[-1] if '/' in product['id'] else product['id']
     handle = product['handle']
     title = clean(product['title'])
@@ -285,20 +374,7 @@ def generate_matrixify_csv(product, upload_manifest, option_names):
             row[f'Option{i+1} Value'] = entry['options'][i] if i < len(entry['options']) else ''
         row['Variant Image'] = entry['file_url'] if entry.get('variant_id') else ''
         csv_rows.append(row)
-    # Build fieldnames dynamically
-    max_options = len(option_names)
-    fieldnames = ['ID','Handle','Image Type','Image Src','Image Command','Image Position','Variant ID']
-    for i in range(max_options):
-        fieldnames.append(f'Option{i+1} Name')
-        fieldnames.append(f'Option{i+1} Value')
-    fieldnames.append('Variant Image')
-    csv_filename = f'matrixify-import-{title}.csv'
-    with open(csv_filename, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in csv_rows:
-            writer.writerow(row)
-    print(f"Wrote Matrixify CSV: {csv_filename}")
+    return csv_rows
 
 def download_images(product, output_dir="downloaded_images"):
     os.makedirs(output_dir, exist_ok=True)
@@ -518,10 +594,19 @@ def parse_args():
     parser.add_argument('--vendor', help='Filter products by vendor')
     parser.add_argument('--title-keyword', help='Filter products by title keyword')
     parser.add_argument('--limit', type=int, default=50, help='Maximum number of products to process')
+    parser.add_argument('--clean-s3', action='store_true', help='Clean up S3 bucket')
+    parser.add_argument('--s3-prefix', help='Only delete S3 objects with this prefix')
+    parser.add_argument('--s3-days-old', type=int, help='Only delete S3 objects older than this many days')
     return parser.parse_args()
 
 def main():
+    # Clean up previous run files
     args = parse_args()
+    cleanup_previous_run(
+        clean_s3=args.clean_s3,
+        s3_prefix=args.s3_prefix,
+        s3_days_old=args.s3_days_old
+    )
     
     if args.tag or args.vendor or args.title_keyword:
         print("Searching for products with criteria...")
@@ -538,6 +623,21 @@ def main():
             return
             
         print(f"Found {len(products)} products matching the criteria.")
+        
+        # Generate a descriptive filename based on search criteria
+        filename_parts = []
+        if args.tag:
+            filename_parts.append(clean(args.tag))
+        if args.vendor:
+            filename_parts.append(clean(args.vendor))
+        if args.title_keyword:
+            filename_parts.append(clean(args.title_keyword))
+        csv_filename = f'matrixify-import-{"-".join(filename_parts)}.csv'
+        
+        # Collect all CSV rows
+        all_csv_rows = []
+        max_options = 0
+        
         for product in products:
             print(f"\nProcessing product: {product['title']} (ID: {product['id']})")
             
@@ -564,12 +664,33 @@ def main():
             # Upload to S3
             upload_manifest = upload_images(renamed_manifest)
             
-            print("Generating Matrixify CSV...")
-            # Generate Matrixify CSV
+            print("Generating Matrixify CSV rows...")
+            # Get option names for this product
             option_names = [opt['name'] for opt in full_product['variants']['edges'][0]['node']['selectedOptions']]
-            generate_matrixify_csv(full_product, upload_manifest, option_names)
+            max_options = max(max_options, len(option_names))
+            
+            # Generate CSV rows for this product
+            csv_rows = generate_matrixify_csv(full_product, upload_manifest, option_names)
+            all_csv_rows.extend(csv_rows)
             
             print(f"Completed processing for product: {product['title']}")
+        
+        # Write all rows to a single CSV file
+        print(f"\nWriting combined Matrixify CSV: {csv_filename}")
+        fieldnames = ['ID', 'Handle', 'Image Type', 'Image Src', 'Image Command', 'Image Position', 'Variant ID']
+        for i in range(max_options):
+            fieldnames.append(f'Option{i+1} Name')
+            fieldnames.append(f'Option{i+1} Value')
+        fieldnames.append('Variant Image')
+        
+        with open(csv_filename, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in all_csv_rows:
+                writer.writerow(row)
+        
+        print(f"Successfully wrote {len(all_csv_rows)} rows to {csv_filename}")
+        
     elif args.product_id:
         # Original single product flow
         product_id = args.product_id
@@ -580,7 +701,23 @@ def main():
         renamed_manifest = rename_images(product, download_manifest)
         upload_manifest = upload_images(renamed_manifest)
         option_names = [opt['name'] for opt in product['variants']['edges'][0]['node']['selectedOptions']]
-        generate_matrixify_csv(product, upload_manifest, option_names)
+        csv_rows = generate_matrixify_csv(product, upload_manifest, option_names)
+        
+        # Write single product CSV
+        csv_filename = f'matrixify-import-{clean(product["title"])}.csv'
+        fieldnames = ['ID', 'Handle', 'Image Type', 'Image Src', 'Image Command', 'Image Position', 'Variant ID']
+        for i in range(len(option_names)):
+            fieldnames.append(f'Option{i+1} Name')
+            fieldnames.append(f'Option{i+1} Value')
+        fieldnames.append('Variant Image')
+        
+        with open(csv_filename, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in csv_rows:
+                writer.writerow(row)
+        
+        print(f"Successfully wrote {len(csv_rows)} rows to {csv_filename}")
     else:
         print("Error: Please provide either --product-id, --product-ids, or search criteria (--tag, --vendor, --title-keyword)")
         sys.exit(1)
