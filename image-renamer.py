@@ -331,6 +331,7 @@ def generate_matrixify_csv(product, upload_manifest, option_names, csv_filename=
     product_id = product['id'].split('/')[-1] if '/' in product['id'] else product['id']
     handle = product['handle']
     title = clean(product['title'])
+    
     # Build a mapping from variant_id to its images (in order)
     variant_to_images = {}
     product_level_images = []
@@ -339,10 +340,14 @@ def generate_matrixify_csv(product, upload_manifest, option_names, csv_filename=
             variant_to_images.setdefault(entry['variant_id'], []).append(entry)
         else:
             product_level_images.append(entry)
+    
     # Build the global gallery order
     gallery_list = []
+    
     # Get all variant IDs in the order they appear in the product
     variant_ids = [v['node']['id'] for v in product['variants']['edges']]
+    
+    # First, add all variant-mapped images
     for variant_id in variant_ids:
         images = variant_to_images.get(variant_id, [])
         if images:
@@ -350,14 +355,20 @@ def generate_matrixify_csv(product, upload_manifest, option_names, csv_filename=
             for i, entry in enumerate(images):
                 gallery_list.append({
                     **entry,
-                    'variant_id': variant_id if i == 0 else None  # Only first image mapped to variant
+                    'variant_id': variant_id if i == 0 else None,  # Only first image mapped to variant
+                    'is_variant_mapped': i == 0  # Flag to identify variant-mapped images
                 })
-    # Add any remaining product-level images (not already included)
+    
+    # Then add any remaining product-level images
     used_image_ids = set(e['image_id'] for e in gallery_list)
     for entry in product_level_images:
         if entry['image_id'] not in used_image_ids:
-            gallery_list.append(entry)
-    # Assign global Image Position
+            gallery_list.append({
+                **entry,
+                'is_variant_mapped': False
+            })
+    
+    # Generate CSV rows
     csv_rows = []
     for idx, entry in enumerate(gallery_list, 1):
         row = {
@@ -369,11 +380,31 @@ def generate_matrixify_csv(product, upload_manifest, option_names, csv_filename=
             'Image Position': idx,
             'Variant ID': entry['variant_id'].split('/')[-1] if entry.get('variant_id') else '',
         }
-        for i, name in enumerate(option_names):
-            row[f'Option{i+1} Name'] = name
-            row[f'Option{i+1} Value'] = entry['options'][i] if i < len(entry['options']) else ''
-        row['Variant Image'] = entry['file_url'] if entry.get('variant_id') else ''
+        
+        # Get the variant data to get the correct option names and values
+        variant_data = None
+        if entry.get('variant_id'):
+            for variant in product['variants']['edges']:
+                if variant['node']['id'] == entry['variant_id']:
+                    variant_data = variant['node']
+                    break
+        
+        if variant_data:
+            # Add option names and values from the variant data
+            for i, option in enumerate(variant_data['selectedOptions']):
+                row[f'Option{i+1} Name'] = option['name']
+                row[f'Option{i+1} Value'] = option['value']
+        else:
+            # For product-level images, use the option names from the first variant
+            for i, name in enumerate(option_names):
+                row[f'Option{i+1} Name'] = name
+                row[f'Option{i+1} Value'] = entry['options'][i] if i < len(entry['options']) else ''
+        
+        # Set Variant Image URL only for variant-mapped images
+        row['Variant Image'] = entry['file_url'] if entry.get('is_variant_mapped') else ''
+        
         csv_rows.append(row)
+    
     return csv_rows
 
 def download_images(product, output_dir="downloaded_images"):
@@ -550,10 +581,14 @@ def rename_images(product, download_manifest):
     print(f"Renamed {len(renamed_manifest)} images. Manifest saved to renamed_manifest.json.")
     return renamed_manifest, option_names
 
-def search_products(tag=None, vendor=None, title_keyword=None, limit=50):
+def search_products(tag=None, vendor=None, title_keyword=None, category=None, exclude_title_keyword=None, limit=100):
     query = """
-    query searchProducts($query: String!, $first: Int!) {
-      products(first: $first, query: $query) {
+    query searchProducts($query: String!, $first: Int!, $after: String) {
+      products(first: $first, after: $after, query: $query) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         edges {
           node {
             id
@@ -561,6 +596,14 @@ def search_products(tag=None, vendor=None, title_keyword=None, limit=50):
             title
             vendor
             tags
+            productType
+            collections(first: 10) {
+              edges {
+                node {
+                  title
+                }
+              }
+            }
           }
         }
       }
@@ -575,16 +618,39 @@ def search_products(tag=None, vendor=None, title_keyword=None, limit=50):
         search_terms.append(f"vendor:{vendor}")
     if title_keyword:
         search_terms.append(f"title:*{title_keyword}*")
+    if category:
+        search_terms.append(f"collection:{category}")
     
     search_query = " AND ".join(search_terms) if search_terms else ""
-    variables = {
-        "query": search_query,
-        "first": limit
-    }
     
-    data = graphql(query, variables)
-    products = data.get('data', {}).get('products', {}).get('edges', [])
-    return [edge['node'] for edge in products]
+    all_products = []
+    has_next_page = True
+    end_cursor = None
+    
+    while has_next_page:
+        variables = {
+            "query": search_query,
+            "first": limit,
+            "after": end_cursor
+        }
+        
+        data = graphql(query, variables)
+        products_data = data.get('data', {}).get('products', {})
+        
+        # Extract products from current page
+        products = [edge['node'] for edge in products_data.get('edges', [])]
+        all_products.extend(products)
+        
+        # Check if there are more pages
+        page_info = products_data.get('pageInfo', {})
+        has_next_page = page_info.get('hasNextPage', False)
+        end_cursor = page_info.get('endCursor')
+    
+    # Exclude products with exclude_title_keyword
+    if exclude_title_keyword:
+        all_products = [p for p in all_products if exclude_title_keyword.lower() not in p['title'].lower()]
+    
+    return all_products
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Process product images for Shopify.')
@@ -593,6 +659,8 @@ def parse_args():
     parser.add_argument('--tag', help='Filter products by tag')
     parser.add_argument('--vendor', help='Filter products by vendor')
     parser.add_argument('--title-keyword', help='Filter products by title keyword')
+    parser.add_argument('--exclude-title-keyword', help='Exclude products with this keyword in the title')
+    parser.add_argument('--category', help='Filter products by collection/category')
     parser.add_argument('--limit', type=int, default=50, help='Maximum number of products to process')
     parser.add_argument('--clean-s3', action='store_true', help='Clean up S3 bucket')
     parser.add_argument('--s3-prefix', help='Only delete S3 objects with this prefix')
@@ -600,107 +668,76 @@ def parse_args():
     return parser.parse_args()
 
 def main():
-    # Clean up previous run files
+    # Parse arguments
     args = parse_args()
-    cleanup_previous_run(
-        clean_s3=args.clean_s3,
-        s3_prefix=args.s3_prefix,
-        s3_days_old=args.s3_days_old
-    )
     
-    if args.tag or args.vendor or args.title_keyword:
+    # Only clean up if we're doing a search, not when processing specific product IDs
+    if args.tag or args.vendor or args.title_keyword or args.category:
+        cleanup_previous_run(
+            clean_s3=args.clean_s3,
+            s3_prefix=args.s3_prefix,
+            s3_days_old=args.s3_days_old
+        )
+    
+    if args.tag or args.vendor or args.title_keyword or args.category:
         print("Searching for products with criteria...")
         # Search for products based on criteria
         products = search_products(
             tag=args.tag,
             vendor=args.vendor,
             title_keyword=args.title_keyword,
+            category=args.category,
+            exclude_title_keyword=args.exclude_title_keyword,
             limit=args.limit
         )
         
         if not products:
             print("No products found matching the search criteria.")
             return
-            
-        print(f"Found {len(products)} products matching the criteria.")
         
-        # Generate a descriptive filename based on search criteria
-        filename_parts = []
-        if args.tag:
-            filename_parts.append(clean(args.tag))
-        if args.vendor:
-            filename_parts.append(clean(args.vendor))
-        if args.title_keyword:
-            filename_parts.append(clean(args.title_keyword))
-        csv_filename = f'matrixify-import-{"-".join(filename_parts)}.csv'
-        
-        # Collect all CSV rows
-        all_csv_rows = []
-        max_options = 0
-        
+        print(f"\nFound {len(products)} products matching the criteria:")
         for product in products:
-            print(f"\nProcessing product: {product['title']} (ID: {product['id']})")
-            
-            # Create product-specific directories
-            product_id = product['id'].split('/')[-1]
-            download_dir = f"downloaded_images/{product_id}"
-            renamed_dir = f"renamed_images/{product_id}"
-            os.makedirs(download_dir, exist_ok=True)
-            os.makedirs(renamed_dir, exist_ok=True)
-            
-            print("Getting full product data...")
-            # Get full product data
-            full_product = get_product_data(product['id'])
-            
-            print("Downloading images...")
-            # Download images
-            download_manifest = download_images(full_product, download_dir)
-            
-            print("Renaming images...")
-            # Rename images
-            renamed_manifest = rename_images(full_product, download_manifest)
-            
-            print("Uploading to S3...")
-            # Upload to S3
+            print(f"\nTitle: {product['title']}")
+            print(f"ID: {product['id']}")
+            print(f"Handle: {product['handle']}")
+            print(f"Vendor: {product['vendor']}")
+            print(f"Product Type: {product['productType']}")
+            print(f"Tags: {', '.join(product['tags'])}")
+            print("-" * 80)
+        
+        # Process all found products
+        all_csv_rows = []
+        for product in products:
+            print(f"\nProcessing product: {product['title']} ({product['id']})")
+            product_data = get_product_data(product['id'])
+            download_manifest = download_images(product_data)
+            renamed_manifest, option_names = rename_images(product_data, download_manifest)
             upload_manifest = upload_images(renamed_manifest)
-            
-            print("Generating Matrixify CSV rows...")
-            # Get option names for this product
-            option_names = [opt['name'] for opt in full_product['variants']['edges'][0]['node']['selectedOptions']]
-            max_options = max(max_options, len(option_names))
-            
-            # Generate CSV rows for this product
-            csv_rows = generate_matrixify_csv(full_product, upload_manifest, option_names)
+            csv_rows = generate_matrixify_csv(product_data, upload_manifest, option_names)
             all_csv_rows.extend(csv_rows)
-            
-            print(f"Completed processing for product: {product['title']}")
         
-        # Write all rows to a single CSV file
-        print(f"\nWriting combined Matrixify CSV: {csv_filename}")
-        fieldnames = ['ID', 'Handle', 'Image Type', 'Image Src', 'Image Command', 'Image Position', 'Variant ID']
-        for i in range(max_options):
-            fieldnames.append(f'Option{i+1} Name')
-            fieldnames.append(f'Option{i+1} Value')
-        fieldnames.append('Variant Image')
-        
-        with open(csv_filename, 'w', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in all_csv_rows:
-                writer.writerow(row)
-        
-        print(f"Successfully wrote {len(all_csv_rows)} rows to {csv_filename}")
-        
+        # Write combined CSV
+        csv_filename = f"matrixify-import-batch.csv"
+        if all_csv_rows:
+            fieldnames = list(all_csv_rows[0].keys())
+            with open(csv_filename, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in all_csv_rows:
+                    writer.writerow(row)
+            print(f"Successfully wrote {len(all_csv_rows)} rows to {csv_filename}")
+        else:
+            print("No CSV rows generated.")
+        return
     elif args.product_id:
-        # Original single product flow
+        # Single product flow
         product_id = args.product_id
         if not product_id.startswith('gid://'):
             product_id = f'gid://shopify/Product/{product_id}'
         product = get_product_data(product_id)
         download_manifest = download_images(product)
-        renamed_manifest = rename_images(product, download_manifest)
+        renamed_manifest, option_names = rename_images(product, download_manifest)
         upload_manifest = upload_images(renamed_manifest)
-        option_names = [opt['name'] for opt in product['variants']['edges'][0]['node']['selectedOptions']]
         csv_rows = generate_matrixify_csv(product, upload_manifest, option_names)
         
         # Write single product CSV
@@ -718,6 +755,38 @@ def main():
                 writer.writerow(row)
         
         print(f"Successfully wrote {len(csv_rows)} rows to {csv_filename}")
+    elif args.product_ids:
+        # Multiple products flow
+        product_ids = [pid.strip() for pid in args.product_ids.split(',')]
+        all_csv_rows = []
+        
+        for product_id in product_ids:
+            if not product_id.startswith('gid://'):
+                product_id = f'gid://shopify/Product/{product_id}'
+            print(f"\nProcessing product ID: {product_id}")
+            try:
+                product = get_product_data(product_id)
+                download_manifest = download_images(product)
+                renamed_manifest, option_names = rename_images(product, download_manifest)
+                upload_manifest = upload_images(renamed_manifest)
+                csv_rows = generate_matrixify_csv(product, upload_manifest, option_names)
+                all_csv_rows.extend(csv_rows)
+            except Exception as e:
+                print(f"Error processing product {product_id}: {str(e)}")
+                continue
+        
+        # Write combined CSV
+        csv_filename = f"matrixify-import-batch.csv"
+        if all_csv_rows:
+            fieldnames = list(all_csv_rows[0].keys())
+            with open(csv_filename, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in all_csv_rows:
+                    writer.writerow(row)
+            print(f"Successfully wrote {len(all_csv_rows)} rows to {csv_filename}")
+        else:
+            print("No CSV rows generated.")
     else:
         print("Error: Please provide either --product-id, --product-ids, or search criteria (--tag, --vendor, --title-keyword)")
         sys.exit(1)

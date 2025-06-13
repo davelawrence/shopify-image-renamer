@@ -8,9 +8,10 @@ This application automates the process of downloading, renaming, and re-uploadin
 - Renames images according to a specific format, including all variant options.
 - Uploads images to AWS S3 and retrieves public URLs.
 - Generates a Matrixify-compatible CSV for bulk import.
-- Supports processing multiple products based on tags, vendor, and title keywords.
+- Supports processing multiple products based on tags, vendor, title keywords, and categories.
 - Includes S3 bucket cleanup functionality to manage storage.
 - Modular, CLI-driven workflow for robust testing and automation.
+- Utility scripts for debugging and verification.
 
 ## Prerequisites
 
@@ -66,6 +67,8 @@ Only source code and documentation are tracked in version control.
 - `--tag`: Optional. Filter products by tag
 - `--vendor`: Optional. Filter products by vendor
 - `--title-keyword`: Optional. Filter products by title keyword
+- `--exclude-title-keyword`: Optional. Exclude products with this keyword in the title
+- `--category`: Optional. Filter products by collection/category
 - `--limit`: Optional. Maximum number of products to process (default: 50)
 - `--clean-s3`: Optional. Enable S3 bucket cleanup
 - `--s3-prefix`: Optional. Only delete S3 objects with this prefix
@@ -81,12 +84,45 @@ python image-renamer.py --tag "VRF New" --vendor "Stressless" --title-keyword "r
 
 # Process up to 5 products with tag "VRF New"
 python image-renamer.py --tag "VRF New" --limit 5
+
+# Process all products of type "Recliner"
+python image-renamer.py --category "Recliner"
+
+# Exclude products with specific keywords
+python image-renamer.py --tag "VRF New" --exclude-title-keyword "discontinued"
+
+# Combine multiple filters
+python image-renamer.py --category "Recliner" --vendor "Stressless" --tag "VRF New"
 ```
 
 When processing multiple products:
 - Images are organized in product-specific directories
 - A single combined Matrixify CSV is generated with a descriptive filename
 - The CSV includes all products with their respective variant images
+
+### Utility Scripts
+
+The repository includes several utility scripts for debugging and verification:
+
+1. `check_api_response.py`: Debug API responses for specific product IDs
+   ```bash
+   python check_api_response.py
+   ```
+
+2. `check_product_count.py`: Check the number of products matching specific criteria
+   ```bash
+   python check_product_count.py
+   ```
+
+3. `extract_ids.py`: Compare IDs between manifests and CSV files
+   ```bash
+   python extract_ids.py
+   ```
+
+4. `generate_csv.py`: Generate CSV files from manifests
+   ```bash
+   python generate_csv.py
+   ```
 
 ### S3 Bucket Cleanup
 
@@ -150,6 +186,7 @@ python image-renamer.py --stage all --product-id 9660968927529
 - You can inspect intermediate files to verify correctness before moving to the next step.
 - For new product types or catalog changes, use the `--confirm` flag to layer in manual verification.
 - When satisfied, run the full pipeline automatically for efficiency.
+- Use the utility scripts for debugging and verification when needed.
 
 ## Workflow
 
@@ -176,6 +213,8 @@ Shopify does not have a true "variant gallery". Instead, the first image for a v
 ## Troubleshooting
 
 - If you see an error like `"Variant ID" [gid://shopify/ProductVariant/50200915214633] must be a number`, ensure your CSV contains only the numeric part of the Variant ID (e.g., `50200915214633`). The script now handles this automatically.
+- Use the utility scripts to debug API responses, verify product counts, and check ID consistency.
+- If option names appear reversed in the CSV, the script now correctly maps them from the variant data.
 
 ## License
 
